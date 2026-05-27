@@ -1,0 +1,14 @@
+# Dependencies
+node_modules/
+
+# Secrets / credentials
+firebase-account-key.json
+
+# Archives
+*.tar
+*.tar.gz
+*.tgz
+
+# Logs
+*.log
+npm-debug.log*

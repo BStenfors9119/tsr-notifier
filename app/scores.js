@@ -45,6 +45,14 @@ const rp = require('request-promise');
         return scores;
     }
 
+    // FIFA World Cup — its own named loader like the other leagues, since it's
+    // the marquee soccer competition (mirrors backend/app/game/scores.js).
+    const loadFifaWorldCupScores = async (tzOffset, gameDay) => {
+        let scores = rp(`https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard`);
+
+        return scores;
+    }
+
 module.exports = {
     loadNflScores: loadNflScores,
     loadMlbScores: loadMlbScores,
@@ -52,5 +60,6 @@ module.exports = {
     loadNhlScores: loadNhlScores,
     loadNcaafScores: loadNcaafScores,
     loadNcaabScores: loadNcaabScores,
-    loadSoccerScores: loadSoccerScores
+    loadSoccerScores: loadSoccerScores,
+    loadFifaWorldCupScores: loadFifaWorldCupScores
 }

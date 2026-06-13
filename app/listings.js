@@ -14,17 +14,30 @@ const getScores = (tzOffset, gameDay) => {
         let nhlScoresPromise = scores.loadNhlScores(tzOffset, gameDay);
         let ncaafScoresPromise = scores.loadNcaafScores(tzOffset, gameDay);
         let ncaabScoresPromise = scores.loadNcaabScores(tzOffset, gameDay);
-        let uefaScoresPromise = scores.loadSoccerScores('uefa.champions', tzOffset, gameDay);
-        let eplScoresPromise = scores.loadSoccerScores('eng.1', tzOffset, gameDay);
-        let bundScoresPromise = scores.loadSoccerScores('ger.1', tzOffset, gameDay);
-        let laligaScoresPromise = scores.loadSoccerScores('arg.copa_lpf', tzOffset, gameDay);
-        let mlsScoresPromise = scores.loadSoccerScores('usa.1', tzOffset, gameDay);
+        // Soccer scoreboards — must mirror backend/app/game/games.api.js so the
+        // notifier pushes live updates for the same competitions the forecast
+        // attaches (the client matches pushes to listings by ESPN uid). Same
+        // ESPN soccer URL via loadSoccerScores; each .catch-guarded so one bad
+        // league can't reject Promise.all and stop ALL score pushes.
+        const soccerLeagues = [
+            'uefa.champions',                                              // UEFA Champions League
+            'eng.1', 'esp.1', 'ger.1', 'ita.1', 'fra.1',                  // top European leagues
+            'usa.1', 'mex.1', 'arg.copa_lpf',                             // MLS, Liga MX, Argentina
+            'fifa.worldq.conmebol', 'fifa.worldq.uefa', 'fifa.worldq.concacaf', // WC qualifiers
+            'fifa.friendly', 'conmebol.america'                            // friendlies, Copa America
+        ];
+        const soccerScorePromises = soccerLeagues.map((league) =>
+            scores.loadSoccerScores(league, tzOffset, gameDay)
+                .catch(() => JSON.stringify({ events: [] })));
+        // FIFA World Cup uses its own named loader (the marquee competition).
+        const fifaWorldCupPromise = scores.loadFifaWorldCupScores(tzOffset, gameDay)
+            .catch(() => JSON.stringify({ events: [] }));
 
         try {
             console.time("get Scores time");
             Promise.all([nflScorePromise, nbaScoresPromise, mlbScoresPromise, nhlScoresPromise,
                 ncaafScoresPromise, ncaabScoresPromise,
-                uefaScoresPromise, eplScoresPromise, bundScoresPromise, laligaScoresPromise, mlsScoresPromise])
+                fifaWorldCupPromise, ...soccerScorePromises])
                 .then(async (scores) => {
                     // console.log('day: ', day);
                     scores.forEach((leagueScores) => {
@@ -50,7 +63,7 @@ const getScores = (tzOffset, gameDay) => {
 const startMonitoringListings = async (fbAdmin) => {
     const tz = "America/Los_Angeles";
     let todaysScores = [];
-    ns.scheduleJob('*/30 * * * * *', async () => {
+    ns.scheduleJob('*/15 * * * * *', async () => {
         const today = momentTz().tz(tz).format("YYYYMMDD");
         console.log('today: ', today);
         let updatedScores = [];

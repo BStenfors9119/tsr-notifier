@@ -4,16 +4,31 @@ const ns = require('node-schedule'),
     bytes = require('utf8-length')
     scores = require('./scores');
 
+// EVERY feed promise must go through this. An unguarded reject here was the
+// outage: Promise.all below rejects, the `.then` that calls res() never runs, so
+// getScores NEVER SETTLES — and the surrounding try/catch can't see an async
+// rejection. On Node >= 15 (this image is node:16) that unhandled rejection also
+// TERMINATES the process; `--restart unless-stopped` then bounces the container,
+// which wipes the in-memory `todaysScores` baseline, so the first tick after
+// restart treats every game as new and sends nothing. Crash faster than two
+// ticks and it can never push an update at all — a live-looking container
+// emitting silence. One flaky ESPN endpoint was enough to trigger the whole
+// chain. An empty scoreboard is always a safe substitute for a failed one.
+const guard = (promise, label) =>
+    promise.catch((err) => {
+        console.warn(`[scores] ${label} feed failed:`, err && err.message);
+        return JSON.stringify({ events: [] });
+    });
+
 const getScores = (tzOffset, gameDay) => {
     let allScores = [];
-    console.log('get scores: ', gameDay);
     return new Promise((res, rej) => {
-        let nflScorePromise = scores.loadNflScores(tzOffset, gameDay);
-        let nbaScoresPromise = scores.loadNbaScores(tzOffset, gameDay);
-        let mlbScoresPromise = scores.loadMlbScores(tzOffset, gameDay);
-        let nhlScoresPromise = scores.loadNhlScores(tzOffset, gameDay);
-        let ncaafScoresPromise = scores.loadNcaafScores(tzOffset, gameDay);
-        let ncaabScoresPromise = scores.loadNcaabScores(tzOffset, gameDay);
+        let nflScorePromise = guard(scores.loadNflScores(tzOffset, gameDay), 'nfl');
+        let nbaScoresPromise = guard(scores.loadNbaScores(tzOffset, gameDay), 'nba');
+        let mlbScoresPromise = guard(scores.loadMlbScores(tzOffset, gameDay), 'mlb');
+        let nhlScoresPromise = guard(scores.loadNhlScores(tzOffset, gameDay), 'nhl');
+        let ncaafScoresPromise = guard(scores.loadNcaafScores(tzOffset, gameDay), 'ncaaf');
+        let ncaabScoresPromise = guard(scores.loadNcaabScores(tzOffset, gameDay), 'ncaab');
         // Soccer scoreboards — must mirror backend/app/game/games.api.js so the
         // notifier pushes live updates for the same competitions the forecast
         // attaches (the client matches pushes to listings by ESPN uid). Same
@@ -27,67 +42,86 @@ const getScores = (tzOffset, gameDay) => {
             'fifa.friendly', 'conmebol.america'                            // friendlies, Copa America
         ];
         const soccerScorePromises = soccerLeagues.map((league) =>
-            scores.loadSoccerScores(league, tzOffset, gameDay)
-                .catch(() => JSON.stringify({ events: [] })));
+            guard(scores.loadSoccerScores(league, tzOffset, gameDay), `soccer:${league}`));
         // FIFA World Cup uses its own named loader (the marquee competition).
-        const fifaWorldCupPromise = scores.loadFifaWorldCupScores(tzOffset, gameDay)
-            .catch(() => JSON.stringify({ events: [] }));
+        const fifaWorldCupPromise = guard(
+            scores.loadFifaWorldCupScores(tzOffset, gameDay), 'fifa.world');
 
-        try {
-            console.time("get Scores time");
-            Promise.all([nflScorePromise, nbaScoresPromise, mlbScoresPromise, nhlScoresPromise,
-                ncaafScoresPromise, ncaabScoresPromise,
-                fifaWorldCupPromise, ...soccerScorePromises])
-                .then(async (scores) => {
-                    // console.log('day: ', day);
-                    scores.forEach((leagueScores) => {
-                        // console.log('league scores');
-                        // console.log(leagueScores);
-                        let events = JSON.parse(leagueScores).events;
-                        if (events !== undefined) {
-                            allScores.push(...events);
-                        }
-                    });
-
-                    res(allScores);
+        Promise.all([nflScorePromise, nbaScoresPromise, mlbScoresPromise, nhlScoresPromise,
+            ncaafScoresPromise, ncaabScoresPromise,
+            fifaWorldCupPromise, ...soccerScorePromises])
+            .then((leagueResults) => {
+                leagueResults.forEach((leagueScores) => {
+                    // Body may be unparseable even on a 200 (ESPN occasionally
+                    // serves an HTML error page). Never let that kill the batch.
+                    try {
+                        const events = JSON.parse(leagueScores).events;
+                        if (events !== undefined) allScores.push(...events);
+                    } catch (err) {
+                        console.warn('[scores] unparseable feed body:', err && err.message);
+                    }
                 });
-            console.timeEnd("get Scores time");
-        } catch (err) {
-            // console.log('Error loading scores', err);
-            rej('Error loading scores');
-        }
+                res(allScores);
+            })
+            // Belt to guard()'s braces: even with every feed caught, a throw
+            // inside the .then above would otherwise leave this promise pending
+            // forever. Resolve with whatever we have rather than hanging.
+            .catch((err) => {
+                console.warn('[scores] batch failed, using partial set:', err && err.message);
+                res(allScores);
+            });
     })
 
 }
 
+const HEARTBEAT_MS = 5 * 60 * 1000;
+
 const startMonitoringListings = async (fbAdmin) => {
     const tz = "America/Los_Angeles";
     let todaysScores = [];
+    let lastHeartbeat = 0;
+    // The whole tick is wrapped: node-schedule does not catch throws from an
+    // async callback, so anything escaping here became an unhandled rejection
+    // and (Node >= 15) took the process down. A bad tick must cost one tick,
+    // never the service — a restart is what wipes `todaysScores` and blinds the
+    // next tick's diff.
     ns.scheduleJob('*/15 * * * * *', async () => {
+      try {
         const today = momentTz().tz(tz).format("YYYYMMDD");
-        console.log('today: ', today);
         let updatedScores = [];
-        // console.log('scheduled job: ', todaysScores.length);
-        if(todaysScores.length > 0) {
-            todaysScores.forEach((score, idx, arr) => {
-                // console.log('score date: ', moment(score.date));
-                const scoreDate = momentTz(score.date).tz(tz).isBefore(today);
-                console.log('score date: ', score.date, scoreDate);
-                if (scoreDate) {
-                    arr.splice(idx, 1);
-                }
-            })
+        // Drop anything from a previous day. Rebuilt with filter() rather than
+        // splice()-inside-forEach, which shifts the array under the iterator and
+        // skips every element after a removal. `date` is already a YYYYMMDD
+        // string, so compare as strings — re-parsing it through moment was both
+        // needless and per-item log spam (~140 cached games x 4 ticks/min).
+        if (todaysScores.length > 0) {
+            const before = todaysScores.length;
+            todaysScores = todaysScores.filter((s) => s.date >= today);
+            if (before !== todaysScores.length) {
+                console.log(`[scores] purged ${before - todaysScores.length} stale game(s)`);
+            }
         }
         // console.log('monitoring: ', todaysScores.length);
         const scores = await getScores('', today)
         scores.forEach(score => {
-            const scoreOne = score.competitions[0].competitors[1].score;
-            const scoreTwo = score.competitions[0].competitors[0].score;
-            const lastPlay = score.competitions[0].situation !== undefined
-            && score.competitions[0].situation.lastPlay !== undefined
-                ? score.competitions[0].situation.lastPlay.text : '';
-            const timeAndPeriod = score.status.type.detail;
-            // console.log('score name: ', score.id, score.name, scoreOne, scoreTwo);
+            // Every read below was unguarded. A single event missing
+            // competitions/competitors/status — postponed games and some soccer
+            // fixtures ship exactly that — threw inside this forEach, and with
+            // no try/catch anywhere up the stack that became an unhandled
+            // rejection and killed the process. One bad event must never cost us
+            // the other ~140.
+            const competition = score && score.competitions && score.competitions[0];
+            const competitors = (competition && competition.competitors) || [];
+            const detail = score && score.status && score.status.type
+                && score.status.type.detail;
+            if (!competition || competitors.length < 2 || !detail) return;
+
+            const scoreOne = competitors[1].score;
+            const scoreTwo = competitors[0].score;
+            const lastPlay = competition.situation !== undefined
+            && competition.situation.lastPlay !== undefined
+                ? competition.situation.lastPlay.text : '';
+            const timeAndPeriod = detail;
             const scoreDate = momentTz(score.date).tz(tz).format("YYYYMMDD");
 
             const scoreExistsIndex = todaysScores.findIndex(s => s.id === score.uid);
@@ -114,20 +148,33 @@ const startMonitoringListings = async (fbAdmin) => {
                 if (existingScore.scoreOne !== scoreOne
                     || existingScore.scoreTwo !== scoreTwo
                     || existingScore.timeAndPeriod !== timeAndPeriod) {
-                    todaysScores.splice(scoreExistsIndex, 1);
+                    // REPLACE in place. The old code spliced the game out and
+                    // never put it back, so the next tick re-added it via the
+                    // "new game" branch above — meaning a change could only be
+                    // detected every OTHER tick (30s, not 15s) and the tick that
+                    // re-added it silently swallowed whatever changed meanwhile.
+                    todaysScores[scoreExistsIndex] = newScore;
                     updatedScores.push(newScore);
                     console.log('score updated: ', score.name, `( ${lastPlay} )`);
                 }
             }
         });
 
-
-        // console.log('scores: ', todaysScores.length);
         if(updatedScores.length > 0) {
-            console.log(bytes(JSON.stringify(updatedScores)));
-            sendScoreUpdateMessage(updatedScores, fbAdmin);
+            console.log(`[scores] pushing ${updatedScores.length} update(s), ${bytes(JSON.stringify(updatedScores))} bytes`);
+            await sendScoreUpdateMessage(updatedScores, fbAdmin);
         }
-        // console.log('scores', scores);
+
+        // Heartbeat. Without it a silent notifier and a working one look
+        // identical in the logs, which is what made this outage hard to spot.
+        const now = Date.now();
+        if (now - lastHeartbeat > HEARTBEAT_MS) {
+            lastHeartbeat = now;
+            console.log(`[scores] alive — tracking ${todaysScores.length} game(s) for ${today}`);
+        }
+      } catch (err) {
+        console.error('[scores] tick failed (service continues):', err && err.stack ? err.stack : err);
+      }
     })
 
     const sendScoreUpdateMessage = async (updatedScores, fbAdmin) => {
